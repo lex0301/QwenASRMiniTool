@@ -250,9 +250,9 @@ class _ChatLLMRunner:
 
     def transcribe(self, wav_path: str, sys_prompt: str | None = None) -> str:
         """送入 WAV 路徑（絕對路徑），回傳轉錄文字。"""
-        # -ngl all = -ngl 99999,prolog,epilog：把全部 layer（含 audio encoder Conv2D）放 GPU
+        # -ngl {id}:all = 指定裝置 id + 全部 layer（含 audio encoder Conv2D）放 GPU
         # 比 -mgl main N 快 2.7×（GPU 加速 audio encoder + Transformer 兩段）
-        gpu_args = ["-ngl", "all"] if self._n_gpu_layers > 0 else ["-ngl", "0"]
+        gpu_args = ["-ngl", f"{self._device_id}:all"] if self._n_gpu_layers > 0 else ["-ngl", "0"]
         cmd = [
             str(self._exe),
             "-m",    str(self._model_path),
@@ -387,7 +387,9 @@ class _DLLASRRunner:
         # 若缺少此參數，chat->history 的 mm_opening/closing 為空字串，
         # Content::push_back() 會把 {{audio:path}} 當純文字儲存，不做音訊解析。
         # 模型路徑同樣需要 ANSI/ASCII 相容編碼（GetShortPathNameW）。
-        gpu_arg = "all" if n_gpu_layers > 0 else "0"
+        # 帶入 device_id：「1:all」= 裝置 1 全層 GPU，「0:all」= 預設裝置 0
+        # chatllm.cpp -ngl 語法：one_spec ::= [id:]spec
+        gpu_arg = f"{device_id}:all" if n_gpu_layers > 0 else "0"
         model_path_bytes = _to_path_bytes(Path(model_path).resolve())
         for p_b in [
             b"-m", model_path_bytes,
