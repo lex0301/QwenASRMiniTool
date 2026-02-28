@@ -618,6 +618,16 @@ class GPUASREngine:
 # 即時轉錄管理員（與 app.py 相同）
 # ══════════════════════════════════════════════════════
 
+
+def _resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """即時重取樣（numpy 線性插值），供串流取樣率 ≠ 16kHz 時使用。"""
+    if src_sr == dst_sr:
+        return audio
+    n_out = int(len(audio) * dst_sr / src_sr)
+    indices = np.linspace(0, len(audio) - 1, n_out)
+    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+
 class RealtimeManager:
     def __init__(self, asr, device_idx, on_text, on_status,
                  language=None, context=None):
@@ -634,17 +644,46 @@ class RealtimeManager:
     def start(self):
         import sounddevice as sd
         self._running = True
-        # 查詢裝置原生聲道數：立體聲混音等 loopback 裝置需要 2ch
+        # 查詢裝置原生聲道數與取樣率
         dev_info        = sd.query_devices(self.dev_idx, "input")
         self._native_ch = max(1, int(dev_info["max_input_channels"]))
-        self._stream  = sd.InputStream(
-            device=self.dev_idx, samplerate=SAMPLE_RATE,
-            channels=self._native_ch, blocksize=VAD_CHUNK, dtype="float32",
-            callback=self._audio_cb,
-        )
+        native_sr       = int(dev_info["default_samplerate"])
+
+        # 步驟 1：嘗試以 16kHz 開啟（麥克風等 MME/DirectSound 裝置通常支援）
+        self._stream_sr = SAMPLE_RATE
+        try:
+            self._stream = sd.InputStream(
+                device=self.dev_idx, samplerate=SAMPLE_RATE,
+                channels=self._native_ch, blocksize=VAD_CHUNK, dtype="float32",
+                callback=self._audio_cb,
+            )
+        except sd.PortAudioError:
+            # 步驟 2：16kHz 不支援 → 用裝置原生取樣率開啟，回調中即時重取樣
+            # 常見情境：WASAPI 裝置（48kHz only）、部分立體聲混音裝置
+            try:
+                self._stream_sr = native_sr
+                # blocksize 等比例放大，維持 ~32ms 窗口
+                scaled_block = int(VAD_CHUNK * native_sr / SAMPLE_RATE)
+                self._stream = sd.InputStream(
+                    device=self.dev_idx, samplerate=native_sr,
+                    channels=self._native_ch, blocksize=scaled_block,
+                    dtype="float32", callback=self._audio_cb,
+                )
+            except sd.PortAudioError as e:
+                # 步驟 3：任何取樣率都失敗（WDM-KS 立體聲混音等）→ 提供引導訊息
+                raise RuntimeError(
+                    f"無法開啟此音訊裝置（16kHz 與 {native_sr}Hz 均失敗）。\n"
+                    f"此裝置可能為 WDM-KS 模式的立體聲混音，不支援直接錄音。\n\n"
+                    f"擷取系統音訊的替代方案：\n"
+                    f"  1. 安裝虛擬音訊裝置（如 VB-CABLE / CABLE Input）\n"
+                    f"  2. 在 Windows 音效設定中將「立體聲混音」設為預設錄音裝置，\n"
+                    f"     然後選擇 MME 版本的預設輸入裝置"
+                ) from e
+
         threading.Thread(target=self._loop, daemon=True).start()
         self._stream.start()
-        self.on_status("🔴 錄音中…")
+        sr_note = f"（{self._stream_sr}→{SAMPLE_RATE}Hz 重取樣）" if self._stream_sr != SAMPLE_RATE else ""
+        self.on_status(f"🔴 錄音中…{sr_note}")
 
     def stop(self):
         self._running = False
@@ -655,6 +694,9 @@ class RealtimeManager:
     def _audio_cb(self, indata, frames, time_info, status):
         # 多聲道混音取平均轉 mono（立體聲混音 / WASAPI loopback 2ch）
         mono = indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0]
+        # 串流取樣率 ≠ 16kHz 時，即時重取樣至 VAD/ASR 所需的 16kHz
+        if self._stream_sr != SAMPLE_RATE:
+            mono = _resample(mono, self._stream_sr, SAMPLE_RATE)
         self._q.put(mono.copy())
 
     def _loop(self):
