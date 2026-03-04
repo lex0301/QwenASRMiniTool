@@ -495,7 +495,8 @@ class GPUASREngine:
         )
         # 抑制 "Setting pad_token_id to eos_token_id" 重複警告
         import transformers.utils.logging as _tf_logging
-        _tf_logging.set_verbosity_error()
+        import logging as _logging
+        _tf_logging.get_logger("transformers.generation.utils").setLevel(_logging.ERROR)
 
         # ── ForcedAligner（可選，需模型目錄存在）────────────────────────
         self.aligner     = None
